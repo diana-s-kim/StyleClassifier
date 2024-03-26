@@ -8,6 +8,13 @@ from torchvision.transforms import ToTensor,Lambda
 from torch import optim
 import presets_orig
 
+#enable ddp
+import torch.multiprocessing as mp
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+import os
+
 ##parameters
 num_style=20
 crop_size=224
@@ -25,17 +32,17 @@ activations=['relu','relu','relu']
 
 
 ##device 
-device = torch.device("cuda:" + str(0) if torch.cuda.is_available() else "cpu")
+rank = torch.device("cuda:" + str(0) if torch.cuda.is_available() else "cpu")
 
 
 
 ##loss softmax
 
-def train(dataloader, model, loss_fn, optimizer):
+def train(dataloader, model, loss_fn, optimizer, rank):
     size = len(dataloader.dataset)
     model.train()
     for batch, (X, y,_) in enumerate(dataloader):
-        X, y = X.to(device), y.to(device)
+        X, y = X.to(rank), y.to(rank)
 
         # Compute prediction error
         pred = model(X)
@@ -50,14 +57,14 @@ def train(dataloader, model, loss_fn, optimizer):
         loss, current = loss.item(), (batch + 1) * len(X)
         print(f"loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
 
-def test(dataloader, model, loss_fn):
+def test(dataloader, model, loss_fn, rank):
     size = len(dataloader.dataset)
     num_batches = len(dataloader)
     model.eval()
     test_loss, correct = 0, 0
     with torch.no_grad():
         for batch, (X, y,_) in enumerate(dataloader):
-            X, y = X.to(device), y.to(device)
+            X, y = X.to(rank), y.to(rank)
             pred = model(X)
             current = (batch + 1) * len(X)
             test_loss += loss_fn(pred, y).item()
@@ -67,18 +74,31 @@ def test(dataloader, model, loss_fn):
     correct /= size
     print(f"Test Error: \n Accuracy: {(100*correct):>0.1f}%, Avg loss: {test_loss:>8f} \n")
 
+def ddp_setup(rank: int, world_size: int):
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12356"
+    print("ddpm_setup_yet")
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+    print("ddp_setup_complete")
 
-def main():
+def ddp_cleanup():
+     dist.destroy_process_group()
+    
+def main(rank,world_size):
+    ddp_setup(rank, world_size)
     #build model
-    model=StyleNet(name=netname,mlp=mlp,dropout=dropout,activations=activations).to(device)
-    for param in model.net.conv.parameters(): #learning rate adjust maybe needed
+    model=StyleNet(name=netname,mlp=mlp,dropout=dropout,activations=activations).to(rank)
+    ddp_model = DDP(model, device_ids=[rank],find_unused_parameters=True)
+    print("model set up")
+    for param in ddp_model.module.net.conv.parameters(): #learning rate adjust maybe needed
         param.requires_grad = False
-    print(list(model.children()))
+    print(list(ddp_model.children()))
     criterion = torch.nn.CrossEntropyLoss(reduction='mean')
 
     #optimizer
-#    optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9)
-    optimizer = optim.SGD([{'params':model.net.parameters()},{'params':model.add_fc.parameters(), 'lr': 2.5e-3}],lr=2.5e-4,momentum=0.9)#lower the rate for fine-tuning parts
+#    optimizer = optim.SGD(ddp_model.parameters(), lr=learning_rate, momentum=0.9)
+    optimizer = optim.SGD([{'params':ddp_model.module.net.parameters()},{'params':ddp_model.module.add_fc.parameters(), 'lr': 2.5e-3}],lr=2.5e-4,momentum=0.9)#lower the rate for fine-tuning parts
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
 
     #data
@@ -86,18 +106,21 @@ def main():
     transform_test=presets_orig.ClassificationPresetEval(crop_size=crop_size)
     wikiart_train=WikiArt(annotations_file=wiki_csv,img_dir=img_dir,transform=transform_train,target_transform=None,split='train')
     wikiart_test=WikiArt(annotations_file=wiki_csv,img_dir=img_dir,transform=transform_test,target_transform=None,split='test')
-    train_dataloader = DataLoader(wikiart_train, batch_size=num_batch, shuffle=True)
-    test_dataloader = DataLoader(wikiart_train, batch_size=num_batch, shuffle=False)
+    train_dataloader = DataLoader(wikiart_train, batch_size=num_batch, shuffle=False,sampler=DistributedSampler(wikiart_train))
+    test_dataloader = DataLoader(wikiart_train, batch_size=num_batch, shuffle=False,sampler=DistributedSampler(wikiart_test))
 
     #start training
     for t in range(1,num_epochs+1):
         print(f"Epoch {t}\n------------------------------- \n")
-        train(train_dataloader, model,criterion,optimizer)
+        train_dataloader.sampler.set_epoch(t)
+        train(train_dataloader,ddp_model,criterion,optimizer,rank)
         if t%5==0:
-            torch.save(model.state_dict(),"./model/style_cls_"+str(t)+".pt")
-        test(test_dataloader, model,criterion)
-
-
+            torch.save(ddp_model.module.state_dict(),"./model/style_cls_"+str(t)+".pt")
+        test_dataloader.sampler.set_epoch(t)
+        test(test_dataloader,ddp_model,criterion,rank)
+    clearn_up()
+        
 
 if __name__=="__main__":
-    main()
+    world_size = torch.cuda.device_count()    
+    mp.spawn(main, args=(world_size,), nprocs=world_size,join=True)
